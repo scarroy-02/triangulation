@@ -64,4 +64,4 @@ def print_constants(d, n, reach):
 
 if __name__ == "__main__":
     # Test for d=2, n=1
-    print_constants(2, 1, 1.0)
+    print_constants(4, 2, 1.0)
