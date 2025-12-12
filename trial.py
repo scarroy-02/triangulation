@@ -152,28 +152,28 @@ if __name__ == "__main__":
     output_dir = "./"
     
     # Sphere with Coxeter triangulation
-    f, grad_f, _ = sphere(radius=1.0)
-    generate_and_export_coxeter(
-        "sphere",
-        f, grad_f,
-        box_min=np.array([-1.3, -1.3, -1.3]),
-        box_max=np.array([1.3, 1.3, 1.3]),
-        L=0.25,
-        output_dir=output_dir,
-        required_dist_factor=50
-    )
+    # f, grad_f, _ = sphere(radius=1.0)
+    # generate_and_export_coxeter(
+    #     "sphere",
+    #     f, grad_f,
+    #     box_min=np.array([-1.3, -1.3, -1.3]),
+    #     box_max=np.array([1.3, 1.3, 1.3]),
+    #     L=0.25,
+    #     output_dir=output_dir,
+    #     required_dist_factor=50
+    # )
     
-    # Torus with Coxeter triangulation
-    f, grad_f, _ = torus(R=1.0, r=0.4)
-    generate_and_export_coxeter(
-        "torus",
-        f, grad_f,
-        box_min=np.array([-1.6, -1.6, -0.6]),
-        box_max=np.array([1.6, 1.6, 0.6]),
-        L=0.2,
-        output_dir=output_dir,
-        required_dist_factor=50
-    )
+    # # Torus with Coxeter triangulation
+    # f, grad_f, _ = torus(R=1.0, r=0.4)
+    # generate_and_export_coxeter(
+    #     "torus",
+    #     f, grad_f,
+    #     box_min=np.array([-1.6, -1.6, -0.6]),
+    #     box_max=np.array([1.6, 1.6, 0.6]),
+    #     L=0.2,
+    #     output_dir=output_dir,
+    #     required_dist_factor=50
+    # )
     
     # Small section of sphere for detailed viewing
     f, grad_f, _ = sphere(radius=1.0)
@@ -182,7 +182,7 @@ if __name__ == "__main__":
         f, grad_f,
         box_min=np.array([-0.3, -0.3, 0.8]),
         box_max=np.array([0.3, 0.3, 1.1]),
-        L=0.1,
+        L=0.05,
         output_dir=output_dir,
         required_dist_factor=80
     )
