@@ -1,722 +1,816 @@
 """
-Whitney triangulation for d=3, n=2 (surface in 3D).
+Whitney's Triangulation Algorithm — 2D Manifold in 3D
+=====================================================
 
-Algorithm:
-1. Generate 3D triangulation T (tetrahedra)
-2. Perturb vertices → T̃ (vertices far from tangent planes)
-3. Find edge-surface intersections
-4. Build K: triangulated surface approximating M
-5. Subdivide tetrahedra at intersections
+Based on: Boissonnat, Kachanovich, Wintraecken (2021)
+"Triangulating Submanifolds: An Elementary and Quantified
+ Version of Whitney's Method", DCG 66:386–434
 
-For d=3, n=2:
-- d-n-1 = 0: vertices must be far from spans
-- d-n-2 = -1: only τ' = ∅, so span = T_pM (tangent plane)
-- Each tetrahedron typically intersected at 3 or 4 edges
-- K faces are triangles (3 intersections) or quads split into 2 triangles (4 intersections)
+Case: n = 2 (surface), d = 3 (ambient R³)
+
+Ambient triangulation: Freudenthal (Kuhn) triangulation of R³.
+  Each unit cube is split into d! = 6 tetrahedra via coordinate
+  orderings. This is closely related to the Ã₃ Coxeter triangulation
+  (whose vertex set is the BCC lattice, Fig. 4 right).
+
+Part 1 (§5): Perturb vertices so that the 0-skeleton (= (d-n-1)-skeleton)
+  is far from M.  For codimension 1, push vertices away from T_pM.
+
+Part 2 (§6): Construct K via barycentric subdivision.
+  For each chain  τ¹ ⊂ τ² ⊂ τ³  (edge ⊂ face ⊂ tet) intersecting M,
+  the 2-simplex  {v(τ¹), v(τ²), v(τ³)}  is a triangle of K.
 """
 
+import math
 import numpy as np
-from typing import Dict, List, Tuple, Callable, Set
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
-from coxeter3d import generate_kuhn_triangulation, get_tetrahedron_edges, get_all_edges
-from utils import rho_1, c_tilde
+from scipy.optimize import brentq
+from collections import defaultdict
+from itertools import permutations
+import warnings
+warnings.filterwarnings('ignore')
 
 
-# =============================================================================
-# Perturbation (same logic as 2D, but with tangent plane instead of line)
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════
+# §4: Freudenthal (Kuhn) Triangulation of R³
+# ═══════════════════════════════════════════════════════════════════
+#
+# Each cube [i,i+1]×[j,j+1]×[k,k+1] is subdivided into 6 tetrahedra.
+# For permutation σ of (0,1,2):
+#   v₀ = corner, v₁ = v₀+L·e_{σ(0)}, v₂ = v₁+L·e_{σ(1)}, v₃ = v₂+L·e_{σ(2)}
+#
+# Properties:
+#   - Monohedral (all tets congruent)
+#   - Bounded thickness  t(T) ≈ 0.41 for d=3
+#   - Longest edge = √3·L (cube body diagonal)
+#   - Delaunay
 
-def find_nearest_point_on_M(
-    v: np.ndarray,
-    f: Callable[[np.ndarray], float],
-    grad_f: Callable[[np.ndarray], np.ndarray],
-    max_iter: int = 20,
-    tol: float = 1e-12
-) -> np.ndarray:
-    """Find nearest point p on M = {f = 0} to v using Newton projection."""
-    p = v.copy()
-    for _ in range(max_iter):
-        fp = f(p)
-        if abs(fp) < tol:
-            break
-        gp = grad_f(p)
-        gp_norm_sq = np.dot(gp, gp)
-        if gp_norm_sq < tol:
-            break
-        p = p - fp * gp / gp_norm_sq
-    return p
-
-
-def distance_to_tangent_plane(
-    v: np.ndarray,
-    p: np.ndarray,
-    grad_f: Callable[[np.ndarray], np.ndarray]
-) -> Tuple[float, np.ndarray]:
+class FreudenthalTriangulation3D:
     """
-    Compute distance from v to T_p M (tangent plane at p).
-    
-    For n=2 (surface in 3D), T_p M is a plane through p perpendicular to grad_f(p).
-    
-    Returns:
-        dist: distance from v to T_p M
-        normal: unit normal to T_p M
+    Freudenthal/Kuhn triangulation of R³ with edge length L.
     """
-    gp = grad_f(p)
-    gp_norm = np.linalg.norm(gp)
-    
-    if gp_norm < 1e-12:
-        return 0.0, np.array([0.0, 0.0, 1.0])
-    
-    normal = gp / gp_norm
-    v_minus_p = v - p
-    signed_dist = np.dot(v_minus_p, normal)
-    dist = abs(signed_dist)
-    
-    direction = normal if signed_dist >= 0 else -normal
-    return dist, direction
+
+    def __init__(self, L, bounds, margin=2):
+        """
+        Parameters
+        ----------
+        L : float   – grid spacing (cube side length)
+        bounds : (xmin,xmax,ymin,ymax,zmin,zmax)
+        margin : int – extra cubes beyond bounds
+        """
+        self.L = L
+        self.bounds = bounds
+        self.Lmax = L * np.sqrt(3)  # longest edge (body diagonal)
+
+        # Quality: thickness = min_alt / Lmax  ≈ 1/(√6·√3) ≈ 0.236
+        self.thickness = 1.0 / (np.sqrt(6) * np.sqrt(3))
+
+        # The 6 permutations of axes for cube subdivision
+        self.perms = list(permutations(range(3)))
+
+        # Storage
+        self.vertices = {}           # (i,j,k) -> np.array position
+        self.tetrahedra = []         # list of 4-tuples of vertex keys
+        self.edges = set()           # frozenset of 2 vertex keys
+        self.faces = set()           # frozenset of 3 vertex keys
+
+        # Adjacency (built after generation)
+        self.edge_to_faces = defaultdict(set)
+        self.edge_to_tets = defaultdict(set)
+        self.face_to_tets = defaultdict(set)
+
+        self._generate(margin)
+        self._build_adjacency()
+
+    def _generate(self, margin):
+        xmin, xmax, ymin, ymax, zmin, zmax = self.bounds
+        m = margin
+        L = self.L
+
+        # Integer index ranges
+        i0 = int(np.floor(xmin / L)) - m
+        i1 = int(np.ceil(xmax / L)) + m
+        j0 = int(np.floor(ymin / L)) - m
+        j1 = int(np.ceil(ymax / L)) + m
+        k0 = int(np.floor(zmin / L)) - m
+        k1 = int(np.ceil(zmax / L)) + m
+
+        # Create vertices
+        for i in range(i0, i1 + 2):
+            for j in range(j0, j1 + 2):
+                for k in range(k0, k1 + 2):
+                    self.vertices[(i, j, k)] = np.array(
+                        [i * L, j * L, k * L], dtype=float)
+
+        # Create tetrahedra: 6 per cube
+        e = [np.array([1, 0, 0]), np.array([0, 1, 0]), np.array([0, 0, 1])]
+        for i in range(i0, i1 + 1):
+            for j in range(j0, j1 + 1):
+                for k in range(k0, k1 + 1):
+                    corner = (i, j, k)
+                    for perm in self.perms:
+                        v0 = corner
+                        v1 = (v0[0] + e[perm[0]][0],
+                              v0[1] + e[perm[0]][1],
+                              v0[2] + e[perm[0]][2])
+                        v2 = (v1[0] + e[perm[1]][0],
+                              v1[1] + e[perm[1]][1],
+                              v1[2] + e[perm[1]][2])
+                        v3 = (v2[0] + e[perm[2]][0],
+                              v2[1] + e[perm[2]][1],
+                              v2[2] + e[perm[2]][2])
+
+                        tet = (v0, v1, v2, v3)
+                        tet_idx = len(self.tetrahedra)
+                        self.tetrahedra.append(tet)
+
+                        # Edges (6 per tet)
+                        verts = [v0, v1, v2, v3]
+                        for a in range(4):
+                            for b in range(a + 1, 4):
+                                self.edges.add(frozenset([verts[a], verts[b]]))
+                        # Faces (4 per tet)
+                        for a in range(4):
+                            face = frozenset(
+                                [verts[b] for b in range(4) if b != a])
+                            self.faces.add(face)
+
+    def _build_adjacency(self):
+        """Build edge→face, edge→tet, face→tet maps."""
+        for tet_idx, tet in enumerate(self.tetrahedra):
+            verts = list(tet)
+            # Faces of this tet
+            for a in range(4):
+                face = frozenset([verts[b] for b in range(4) if b != a])
+                self.face_to_tets[face].add(tet_idx)
+                # Edges of this face
+                fv = list(face)
+                for p in range(3):
+                    for q in range(p + 1, 3):
+                        edge = frozenset([fv[p], fv[q]])
+                        self.edge_to_faces[edge].add(face)
+            # Edges of this tet
+            for a in range(4):
+                for b in range(a + 1, 4):
+                    edge = frozenset([verts[a], verts[b]])
+                    self.edge_to_tets[edge].add(tet_idx)
 
 
-def perturb_vertices_3d(
-    vertices: Dict[int, np.ndarray],
-    tetrahedra: List[Tuple[int, int, int, int]],
-    f: Callable[[np.ndarray], float],
-    grad_f: Callable[[np.ndarray], np.ndarray],
-    L: float,
-    required_dist_factor: float = 1.0,
-    d: int = 3,
-    n: int = 2
-) -> Tuple[Dict[int, np.ndarray], Dict[int, dict]]:
+# ═══════════════════════════════════════════════════════════════════
+# Implicit Surface  M = { p ∈ R³ : f(p) = 0 }
+# ═══════════════════════════════════════════════════════════════════
+
+class ImplicitSurface:
     """
-    Perturb vertices according to Whitney's algorithm for d=3, n=2.
+    C² surface in R³ defined implicitly as f⁻¹(0).
+    Oracles (§2.1): closest point on M, tangent plane T_pM.
     """
-    rho = rho_1(d, n)
-    c = c_tilde(d)
-    
-    required_dist = rho * c * L * required_dist_factor
-    max_perturb = c * L * required_dist_factor
-    near_threshold = 3 * L / 2
-    
-    print(f"3D Perturbation constants (d={d}, n={n}):")
-    print(f"  ρ_1 = {rho:.6f}")
-    print(f"  c̃ = {c:.6f}")
-    print(f"  required_dist = {required_dist:.6e}")
-    print(f"  max_perturb = {max_perturb:.6e}")
-    
-    perturbed = {}
-    info = {}
-    
-    for idx, v in vertices.items():
-        f_val = f(v)
-        grad_val = grad_f(v)
-        grad_norm = np.linalg.norm(grad_val)
-        
-        if grad_norm < 1e-12:
-            perturbed[idx] = v.copy()
-            info[idx] = {'case': 0}
-            continue
-        
-        dist_to_M = abs(f_val) / grad_norm
-        
-        if dist_to_M >= near_threshold:
-            perturbed[idx] = v.copy()
-            info[idx] = {'case': 1, 'dist_to_M': dist_to_M}
-            continue
-        
-        p = find_nearest_point_on_M(v, f, grad_f)
-        dist_to_TpM, direction = distance_to_tangent_plane(v, p, grad_f)
-        
-        if dist_to_TpM >= required_dist:
-            perturbed[idx] = v.copy()
-            info[idx] = {'case': 2, 'action': 'already_far'}
-            continue
-        
-        move_amount = min(required_dist - dist_to_TpM, max_perturb)
-        v_pert = v + direction * move_amount
-        
-        perturbed[idx] = v_pert
-        info[idx] = {
-            'case': 2, 'action': 'moved',
-            'v_orig': v.copy(), 'v_pert': v_pert.copy(),
-            'move_amount': move_amount
-        }
-    
-    return perturbed, info
 
+    def __init__(self, f, grad_f, reach, name="surface"):
+        self.f = f
+        self.grad_f = grad_f
+        self.reach = reach
+        self.name = name
 
-# =============================================================================
-# Find intersections and build K
-# =============================================================================
+    def evaluate(self, p):
+        return self.f(p[0], p[1], p[2])
 
-def find_edge_intersection(v0, v1, f, grad_f, tol=1e-10):
-    """Find intersection point on edge (v0, v1) with surface M."""
-    f0, f1 = f(v0), f(v1)
-    
-    if f0 * f1 >= 0:
+    def gradient(self, p):
+        return np.array(self.grad_f(p[0], p[1], p[2]), dtype=float)
+
+    def normal(self, p):
+        """Unit normal N_pM at p ∈ M."""
+        g = self.gradient(p)
+        n = np.linalg.norm(g)
+        return g / n if n > 1e-15 else np.array([0, 0, 1.0])
+
+    def closest_point(self, p, max_iter=60, tol=1e-12):
+        """Oracle 1: project p onto M via Newton iteration."""
+        q = np.array(p, dtype=float)
+        for _ in range(max_iter):
+            val = self.f(q[0], q[1], q[2])
+            if abs(val) < tol:
+                return q
+            g = self.gradient(q)
+            gg = np.dot(g, g)
+            if gg < 1e-20:
+                break
+            q = q - (val / gg) * g
+        if abs(self.f(q[0], q[1], q[2])) < 1e-8:
+            return q
         return None
-    
-    t = -f0 / (f1 - f0)
-    t = np.clip(t, 0, 1)
-    
-    p = v0 + t * (v1 - v0)
-    edge_dir = v1 - v0
-    edge_len = np.linalg.norm(edge_dir)
-    
-    if edge_len > 1e-12:
-        edge_dir = edge_dir / edge_len
-        for _ in range(10):
-            fp = f(p)
-            if abs(fp) < tol:
-                break
-            gp = grad_f(p)
-            grad_along_edge = np.dot(gp, edge_dir)
-            if abs(grad_along_edge) < 1e-12:
-                break
-            dt = -fp / grad_along_edge
-            t = np.clip(t + dt / edge_len, 0, 1)
-            p = v0 + t * (v1 - v0)
-    
-    return p
+
+    def find_edge_intersection(self, p1, p2):
+        """
+        Find unique intersection of M with segment [p1, p2].
+        Lemma 6.4 guarantees at most one point for d-n = 1 edges.
+        """
+        f1 = self.evaluate(p1)
+        f2 = self.evaluate(p2)
+        if abs(f1) < 1e-13:
+            return p1.copy()
+        if abs(f2) < 1e-13:
+            return p2.copy()
+        if f1 * f2 > 0:
+            return None
+
+        def g(t):
+            pt = (1.0 - t) * p1 + t * p2
+            return self.f(pt[0], pt[1], pt[2])
+        try:
+            t_star = brentq(g, 0.0, 1.0, xtol=1e-14)
+            return (1.0 - t_star) * p1 + t_star * p2
+        except ValueError:
+            return None
 
 
-def build_K_surface(
-    vertices: Dict[int, np.ndarray],
-    tetrahedra: List[Tuple[int, int, int, int]],
-    f: Callable[[np.ndarray], float],
-    grad_f: Callable[[np.ndarray], np.ndarray]
-) -> Tuple[List[np.ndarray], List[Tuple[int, int, int]]]:
-    """
-    Build output surface K from edge-surface intersections.
-    
-    For each tetrahedron:
-    - 3 intersections → 1 triangle
-    - 4 intersections → 2 triangles (quad split)
-    
-    Returns:
-        K_vertices: List of vertex positions
-        K_faces: List of triangles as (i, j, k) indices
-    """
-    K_vertices = []
-    K_faces = []
-    edge_to_K_idx = {}  # edge -> K vertex index
-    
-    def get_K_vertex(edge, intersection_point):
-        if edge not in edge_to_K_idx:
-            idx = len(K_vertices)
-            K_vertices.append(intersection_point.copy())
-            edge_to_K_idx[edge] = idx
-        return edge_to_K_idx[edge]
-    
-    for tet in tetrahedra:
-        edges = get_tetrahedron_edges(tet)
-        
-        # Find intersections on each edge
-        intersections = []
-        for e in edges:
-            v0, v1 = vertices[e[0]], vertices[e[1]]
-            p = find_edge_intersection(v0, v1, f, grad_f)
-            if p is not None:
-                k_idx = get_K_vertex(e, p)
-                intersections.append((e, k_idx, p))
-        
-        n_int = len(intersections)
-        
-        if n_int == 3:
-            # One triangle
-            i0, i1, i2 = intersections[0][1], intersections[1][1], intersections[2][1]
-            K_faces.append((i0, i1, i2))
-        
-        elif n_int == 4:
-            # Quadrilateral - split into 2 triangles
-            # Order points around the quad
-            points = [(intersections[i][1], intersections[i][2]) for i in range(4)]
-            
-            # Simple ordering: find centroid and sort by angle
-            centroid = np.mean([p[1] for p in points], axis=0)
-            
-            # Project to plane and sort by angle
-            # Use first point as reference
-            ref = points[0][1] - centroid
-            ref_norm = np.linalg.norm(ref)
-            if ref_norm < 1e-12:
-                # Fallback: just use as-is
-                i0, i1, i2, i3 = [p[0] for p in points]
-            else:
-                ref = ref / ref_norm
-                # Find a perpendicular vector in the plane
-                normal = np.cross(points[1][1] - centroid, points[2][1] - centroid)
-                normal_norm = np.linalg.norm(normal)
-                if normal_norm < 1e-12:
-                    normal = np.array([0, 0, 1])
-                else:
-                    normal = normal / normal_norm
-                perp = np.cross(normal, ref)
-                
-                # Compute angles
-                angles = []
-                for idx, pos in points:
-                    v = pos - centroid
-                    angle = np.arctan2(np.dot(v, perp), np.dot(v, ref))
-                    angles.append((angle, idx))
-                angles.sort()
-                i0, i1, i2, i3 = [a[1] for a in angles]
-            
-            # Two triangles
-            K_faces.append((i0, i1, i2))
-            K_faces.append((i0, i2, i3))
-        
-        # n_int == 0, 1, 2, 5, 6 are edge cases (degenerate or doesn't intersect)
-    
-    return K_vertices, K_faces
+# ═══════════════════════════════════════════════════════════════════
+# Algorithm Constants (§4-5)
+# ═══════════════════════════════════════════════════════════════════
 
+def compute_constants_3d(L, reach, practical_scale=50.0):
+    """Compute algorithm constants for d=3, n=2."""
+    d, n = 3, 2
 
-# =============================================================================
-# Figure 2 subdivision for 3D
-# =============================================================================
+    # Freudenthal thickness ≈ 1/√18 ≈ 0.236
+    t_T = 1.0 / (np.sqrt(6) * np.sqrt(3))  # conservative
+    Lmax = L * np.sqrt(3)  # longest edge
 
-def subdivide_tetrahedron_figure2(
-    tet_verts: List[np.ndarray],
-    tet_indices: List[int],
-    f: Callable[[np.ndarray], float],
-    grad_f: Callable[[np.ndarray], np.ndarray],
-    new_vertex_start_idx: int
-) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]], List[Tuple[int, int, int]], int]:
-    """
-    Subdivide tetrahedron according to Figure 2 construction.
-    
-    For 3 intersections: creates triangular face, barycenter, and subdivided tets
-    For 4 intersections: creates quad face (2 triangles), barycenter, and subdivided tets
-    
-    Returns:
-        new_vertices: List of new vertices (intersection points + barycenter)
-        new_tetrahedra: List of new tetrahedra
-        K_faces: List of K faces (triangles)
-        barycenter_idx: Index of barycenter (or None)
-    """
-    v0, v1, v2, v3 = tet_verts
-    i0, i1, i2, i3 = tet_indices
-    
-    # Get all 6 edges
-    edges = [(0,1), (0,2), (0,3), (1,2), (1,3), (2,3)]
-    edge_verts = [
-        (v0, v1), (v0, v2), (v0, v3),
-        (v1, v2), (v1, v3), (v2, v3)
-    ]
-    edge_indices = [
-        (i0, i1), (i0, i2), (i0, i3),
-        (i1, i2), (i1, i3), (i2, i3)
-    ]
-    local_to_global = {0: i0, 1: i1, 2: i2, 3: i3}
-    
-    # Find intersections
-    intersections = {}  # edge_idx -> intersection point
-    for edge_idx, (va, vb) in enumerate(edge_verts):
-        p = find_edge_intersection(va, vb, f, grad_f)
-        if p is not None:
-            intersections[edge_idx] = p
-    
-    n_int = len(intersections)
-    new_vertices = []
-    new_tetrahedra = []
-    K_faces = []
-    barycenter_idx = None
-    
-    if n_int < 3:
-        # No proper intersection - keep original
-        new_tetrahedra.append((i0, i1, i2, i3))
-        return new_vertices, new_tetrahedra, K_faces, barycenter_idx
-    
-    # Create new vertices for intersection points
-    int_edges = sorted(intersections.keys())
-    p_indices = {}
-    for edge_idx in int_edges:
-        p_idx = new_vertex_start_idx + len(new_vertices)
-        new_vertices.append(intersections[edge_idx])
-        p_indices[edge_idx] = p_idx
-    
-    # Compute barycenter of intersection points
-    int_points = [intersections[e] for e in int_edges]
-    b = np.mean(int_points, axis=0)
-    b_idx = new_vertex_start_idx + len(new_vertices)
-    new_vertices.append(b)
-    barycenter_idx = b_idx
-    
-    if n_int == 3:
-        # One triangular K face
-        e0, e1, e2 = int_edges
-        K_faces.append((p_indices[e0], p_indices[e1], p_indices[e2]))
-        
-        # Create tetrahedra: connect barycenter to original vertices and intersection points
-        # We create tetrahedra by connecting b to each face of the "boundary"
-        
-        # The boundary consists of:
-        # - 3 triangles connecting each original vertex to 2 intersection points
-        # - 1 triangle connecting 3 intersection points (the K face)
-        
-        # Identify which original vertices are on which side
-        # Vertex is "positive" if f(v) > 0, "negative" if f(v) < 0
-        signs = [np.sign(f(v)) for v in tet_verts]
-        pos_verts = [i for i in range(4) if signs[i] > 0]
-        neg_verts = [i for i in range(4) if signs[i] < 0]
-        
-        # Each original vertex connects to b and to nearby intersection points
-        for local_v in range(4):
-            # Find edges incident to this vertex that have intersections
-            incident_int_edges = []
-            for edge_idx, (a, b_local) in enumerate(edges):
-                if (a == local_v or b_local == local_v) and edge_idx in intersections:
-                    incident_int_edges.append(edge_idx)
-            
-            if len(incident_int_edges) >= 2:
-                # This vertex has 2 incident intersection edges
-                # Create tetrahedra: (vertex, p1, p2, barycenter)
-                for j in range(len(incident_int_edges)):
-                    e_a = incident_int_edges[j]
-                    e_b = incident_int_edges[(j+1) % len(incident_int_edges)]
-                    new_tetrahedra.append((
-                        local_to_global[local_v],
-                        p_indices[e_a],
-                        p_indices[e_b],
-                        b_idx
-                    ))
-            elif len(incident_int_edges) == 0:
-                # This vertex has no incident intersections
-                # It connects to all intersection points through the barycenter
-                # Create tetrahedra with neighboring vertices
-                pass
-        
-        # Also create tetrahedra for the K face connecting to non-adjacent vertices
-        # This is complex - let's use a simpler approach:
-        # Just create tetrahedra by connecting b to each triangular face we can form
-        
-        # Simplified approach: connect barycenter to all possible valid triangles
-        all_points = list(range(4))  # original vertex local indices
-        int_point_indices = [p_indices[e] for e in int_edges]
-        
-        # For each original vertex, create tet with b and the 2 nearest intersection points
-        for local_v in range(4):
-            incident = []
-            for edge_idx, (a, b_local) in enumerate(edges):
-                if (a == local_v or b_local == local_v) and edge_idx in int_edges:
-                    incident.append(p_indices[edge_idx])
-            
-            if len(incident) == 2:
-                new_tetrahedra.append((local_to_global[local_v], incident[0], incident[1], b_idx))
-        
-        # Connect pairs of original vertices that share an edge without intersection
-        for edge_idx, (a, b_local) in enumerate(edges):
-            if edge_idx not in int_edges:
-                # This edge has no intersection - the two vertices are on the same side
-                # Find the intersection points adjacent to both
-                a_incident = [e for e in int_edges if a in edges[e]]
-                b_incident = [e for e in int_edges if b_local in edges[e]]
-                
-                # Create tet connecting these two vertices to their shared intersection point and b
-                shared = set(a_incident) & set(b_incident)
-                if len(shared) >= 1:
-                    p = p_indices[list(shared)[0]]
-                    new_tetrahedra.append((local_to_global[a], local_to_global[b_local], p, b_idx))
-    
-    elif n_int == 4:
-        # Quadrilateral K face - split into 2 triangles
-        e0, e1, e2, e3 = int_edges
-        
-        # Order the quad vertices properly (by angle around centroid)
-        quad_points = [(p_indices[e], intersections[e]) for e in int_edges]
-        centroid = np.mean([p[1] for p in quad_points], axis=0)
-        
-        # Sort by angle
-        ref = quad_points[0][1] - centroid
-        ref_norm = np.linalg.norm(ref)
-        if ref_norm > 1e-12:
-            ref = ref / ref_norm
-            normal = np.cross(quad_points[1][1] - centroid, quad_points[2][1] - centroid)
-            normal_norm = np.linalg.norm(normal)
-            if normal_norm > 1e-12:
-                normal = normal / normal_norm
-                perp = np.cross(normal, ref)
-                
-                angles = []
-                for idx, pos in quad_points:
-                    v = pos - centroid
-                    angle = np.arctan2(np.dot(v, perp), np.dot(v, ref))
-                    angles.append((angle, idx))
-                angles.sort()
-                ordered = [a[1] for a in angles]
-            else:
-                ordered = [p[0] for p in quad_points]
-        else:
-            ordered = [p[0] for p in quad_points]
-        
-        # Two triangles for the quad
-        K_faces.append((ordered[0], ordered[1], ordered[2]))
-        K_faces.append((ordered[0], ordered[2], ordered[3]))
-        
-        # Create tetrahedra connecting b to faces
-        for local_v in range(4):
-            incident = []
-            for edge_idx, (a, b_local) in enumerate(edges):
-                if (a == local_v or b_local == local_v) and edge_idx in int_edges:
-                    incident.append(p_indices[edge_idx])
-            
-            if len(incident) == 2:
-                new_tetrahedra.append((local_to_global[local_v], incident[0], incident[1], b_idx))
-            elif len(incident) == 3:
-                # Three intersection points incident to this vertex
-                new_tetrahedra.append((local_to_global[local_v], incident[0], incident[1], b_idx))
-                new_tetrahedra.append((local_to_global[local_v], incident[1], incident[2], b_idx))
-        
-        # Handle edges without intersections
-        for edge_idx, (a, b_local) in enumerate(edges):
-            if edge_idx not in int_edges:
-                # Find common adjacent intersection
-                a_edges = [e for e in int_edges if a in edges[e]]
-                b_edges = [e for e in int_edges if b_local in edges[e]]
-                common = set(a_edges) & set(b_edges)
-                
-                for c_edge in common:
-                    new_tetrahedra.append((
-                        local_to_global[a], 
-                        local_to_global[b_local], 
-                        p_indices[c_edge], 
-                        b_idx
-                    ))
-    
-    else:
-        # n_int >= 5 shouldn't happen for well-behaved surfaces
-        new_tetrahedra.append((i0, i1, i2, i3))
-    
-    return new_vertices, new_tetrahedra, K_faces, barycenter_idx
+    # Theoretical c̃ (eq. 6) — very small
+    c_tilde_theory = t_T ** 2 / 24.0
+    c_tilde = min(c_tilde_theory * practical_scale, 0.42)
 
+    # ρ₁ (Lemma 5.1, d=3 odd, k=(d+1)/2=2)
+    N_leq = 3  # N_{≤0} for d=3, n=2
+    rho1_theory = math.factorial(4) / (
+        2 ** 6 * math.factorial(2) * math.factorial(1) * N_leq)
+    rho1 = min(rho1_theory * practical_scale, 0.90)
 
-def build_subdivided_complex_3d(
-    vertices: Dict[int, np.ndarray],
-    tetrahedra: List[Tuple[int, int, int, int]],
-    f: Callable[[np.ndarray], float],
-    grad_f: Callable[[np.ndarray], np.ndarray]
-):
-    """Build complete subdivided 3D complex with K as internal boundary."""
-    all_vertices = list(vertices.values())
-    vertex_id_to_idx = {vid: idx for idx, vid in enumerate(vertices.keys())}
-    
-    all_tetrahedra = []
-    K_faces = []
-    barycenter_indices = []
-    
-    for tet in tetrahedra:
-        tet_verts = [vertices[tet[i]] for i in range(4)]
-        tet_indices = [vertex_id_to_idx[tet[i]] for i in range(4)]
-        
-        new_vert_start = len(all_vertices)
-        
-        new_verts, new_tets, k_faces, b_idx = subdivide_tetrahedron_figure2(
-            tet_verts, tet_indices, f, grad_f, new_vert_start
-        )
-        
-        all_vertices.extend(new_verts)
-        all_tetrahedra.extend(new_tets)
-        K_faces.extend(k_faces)
-        
-        if b_idx is not None:
-            barycenter_indices.append(b_idx)
-    
-    return np.array(all_vertices), all_tetrahedra, K_faces, barycenter_indices
+    # α₀ (eq. 8)
+    alpha0 = (4.0 / 3.0) * rho1 * c_tilde
 
+    # ζ (eq. 10) — quality bound, clamped positive
+    binom_d_dn = math.comb(d, d - n)  # C(3,1)=3
+    zeta_raw = (8 * t_T * (1 - 8 * min(c_tilde, t_T**2 / 16) / t_T**2)) / (
+        15 * np.sqrt(d) * binom_d_dn * (1 + 2 * c_tilde))
+    zeta = max(zeta_raw, 0.01)
 
-# =============================================================================
-# Visualization
-# =============================================================================
-
-def visualize_whitney_3d(
-    f, grad_f, box_min, box_max, L,
-    required_dist_factor=1.0,
-    output_path=None,
-    title="",
-    show_tetrahedra=False,
-    elev=25, azim=45
-):
-    """Visualize 3D Whitney algorithm."""
-    
-    # Generate and perturb
-    vertices, tetrahedra = generate_kuhn_triangulation(box_min, box_max, L)
-    perturbed, info = perturb_vertices_3d(
-        vertices, tetrahedra, f, grad_f, L, required_dist_factor
-    )
-    
-    # Build K surface
-    K_vertices, K_faces = build_K_surface(perturbed, tetrahedra, f, grad_f)
-    
-    n_moved = sum(1 for i in info.values() if i.get('action') == 'moved')
-    
-    print(f"\n{title}")
-    print(f"  T̃: {len(vertices)} vertices, {len(tetrahedra)} tetrahedra")
-    print(f"  Perturbed: {n_moved} vertices")
-    print(f"  K: {len(K_vertices)} vertices, {len(K_faces)} faces")
-    
-    # Create figure
-    fig = plt.figure(figsize=(14, 10))
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # Draw K faces (green surface)
-    if K_faces:
-        K_verts_arr = np.array(K_vertices)
-        faces_3d = [[K_verts_arr[f[0]], K_verts_arr[f[1]], K_verts_arr[f[2]]] for f in K_faces]
-        
-        poly = Poly3DCollection(faces_3d, alpha=0.7, linewidths=0.5)
-        poly.set_facecolor('#90EE90')  # Light green
-        poly.set_edgecolor('#228B22')  # Dark green
-        ax.add_collection3d(poly)
-    
-    # Draw K vertices
-    if K_vertices:
-        K_arr = np.array(K_vertices)
-        ax.scatter(K_arr[:, 0], K_arr[:, 1], K_arr[:, 2], 
-                  c='green', s=20, edgecolors='darkgreen')
-    
-    # Draw perturbed vertices (red)
-    moved_verts = []
-    for idx, v in vertices.items():
-        if info[idx].get('action') == 'moved':
-            moved_verts.append(perturbed[idx])
-    if moved_verts:
-        mv_arr = np.array(moved_verts)
-        ax.scatter(mv_arr[:, 0], mv_arr[:, 1], mv_arr[:, 2],
-                  c='red', s=50, edgecolors='darkred', label='Perturbed vertices')
-    
-    # Optionally draw some tetrahedra edges
-    if show_tetrahedra:
-        edges = get_all_edges(tetrahedra)
-        edge_lines = []
-        for e in edges:
-            v0, v1 = perturbed[e[0]], perturbed[e[1]]
-            edge_lines.append([v0, v1])
-        lc = Line3DCollection(edge_lines, colors='gray', linewidths=0.3, alpha=0.3)
-        ax.add_collection3d(lc)
-    
-    # Styling
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.set_title(f"{title}\nK: {len(K_faces)} triangles | Perturbed: {n_moved} vertices")
-    ax.view_init(elev=elev, azim=azim)
-    
-    # Set equal aspect ratio
-    max_range = np.max(box_max - box_min) / 2
-    mid = (box_max + box_min) / 2
-    ax.set_xlim(mid[0] - max_range, mid[0] + max_range)
-    ax.set_ylim(mid[1] - max_range, mid[1] + max_range)
-    ax.set_zlim(mid[2] - max_range, mid[2] + max_range)
-    
-    fig.tight_layout()
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
-        plt.close(fig)
-    else:
-        plt.show()
-    
     return {
-        'vertices': perturbed,
-        'tetrahedra': tetrahedra,
-        'K_vertices': K_vertices,
-        'K_faces': K_faces
+        'd': d, 'n': n,
+        'L': L, 'Lmax': Lmax, 'reach': reach,
+        'thickness': t_T,
+        'c_tilde': c_tilde, 'c_tilde_theory': c_tilde_theory,
+        'rho1': rho1, 'rho1_theory': rho1_theory,
+        'alpha0': alpha0,
+        'zeta': zeta,
+        'practical_scale': practical_scale,
     }
 
 
-# =============================================================================
-# Example surfaces
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════
+# §5: Part 1 — Perturbation
+# ═══════════════════════════════════════════════════════════════════
+#
+# For d=3, n=2 (surface in R³), codimension = 1.
+# (d-n-1) = 0: the 0-skeleton (vertices) must be pushed from M.
+# span(τ'_j, T_pM) = T_pM (tangent plane).
+# Push each close vertex away from the tangent plane at a nearby
+# manifold point (§5.2, Case 2, same as codimension-1 in 2D).
 
-def sphere(center=(0, 0, 0), radius=1.0):
-    """Sphere centered at (cx, cy, cz) with given radius."""
-    cx, cy, cz = center
-    f = lambda p: (p[0]-cx)**2 + (p[1]-cy)**2 + (p[2]-cz)**2 - radius**2
-    grad_f = lambda p: np.array([2*(p[0]-cx), 2*(p[1]-cy), 2*(p[2]-cz)])
-    return f, grad_f, radius
+def perturb_vertices(T, surface, consts):
+    """
+    Part 1 (§5.2): Perturb vertices of T so 0-skeleton is far from M.
+
+    Case 1: d(v, M) ≥ 3L_max/2  →  keep v
+    Case 2: d(v, M) < 3L_max/2  →  push v away from T_pM
+    """
+    L = consts['Lmax']  # use longest edge for the 3L/2 threshold
+    c_tilde = consts['c_tilde']
+    rho1 = consts['rho1']
+
+    max_perturb = c_tilde * L          # eq. 17: |v - v~| ≤ c̃L
+    tangent_clearance = rho1 * c_tilde * L  # eq. 20
+
+    perturbed = {}
+    info = {'case1': 0, 'case2': 0, 'max_pert': 0.0}
+
+    for key, v in T.vertices.items():
+        p = surface.closest_point(v)
+        if p is None:
+            perturbed[key] = v.copy()
+            info['case1'] += 1
+            continue
+
+        dist = np.linalg.norm(v - p)
+        if dist >= 1.5 * L:
+            # Case 1
+            perturbed[key] = v.copy()
+            info['case1'] += 1
+        else:
+            # Case 2: push away from T_pM in normal direction
+            nrm = surface.normal(p)
+            normal_comp = np.dot(v - p, nrm)
+
+            if abs(normal_comp) >= tangent_clearance:
+                perturbed[key] = v.copy()
+                info['case1'] += 1
+            else:
+                sign = 1.0 if normal_comp >= 0 else -1.0
+                if abs(normal_comp) < 1e-15:
+                    sign = 1.0
+                target = sign * tangent_clearance
+                disp = (target - normal_comp) * nrm
+                dn = np.linalg.norm(disp)
+                if dn > max_perturb:
+                    disp *= max_perturb / dn
+                perturbed[key] = v + disp
+                info['case2'] += 1
+                info['max_pert'] = max(info['max_pert'], np.linalg.norm(disp))
+
+    return perturbed, info
 
 
-def ellipsoid(a=1.0, b=0.7, c=0.5):
-    """Ellipsoid with semi-axes a, b, c."""
-    f = lambda p: (p[0]/a)**2 + (p[1]/b)**2 + (p[2]/c)**2 - 1
-    grad_f = lambda p: np.array([2*p[0]/a**2, 2*p[1]/b**2, 2*p[2]/c**2])
-    reach = min(c**2/a, c**2/b, b**2/a)  # Approximate
-    return f, grad_f, reach
+# ═══════════════════════════════════════════════════════════════════
+# §6: Part 2 — Construct triangulation K of M
+# ═══════════════════════════════════════════════════════════════════
+#
+# For n=2, d=3 the barycentric-subdivision complex K has:
+#   - Vertices v(τ¹) on edges of T̃ that intersect M  (on M, unique)
+#   - Vertices v(τ²) on faces of T̃ that intersect M  (avg of edge pts)
+#   - Vertices v(τ³) on tets of T̃ that intersect M   (avg of edge pts)
+#   - 2-simplices: {v(τ¹), v(τ²), v(τ³)} for chains τ¹⊂τ²⊂τ³
+#     where all three simplices intersect M  (eq. 25)
+
+def construct_K(T, pverts, surface, consts):
+    """
+    Part 2 (§6.2): Build the simplicial complex K.
+
+    Returns dict with vertex positions and triangle index lists.
+    """
+    # ── Step 1: edge–surface intersections → v(τ¹) ──
+    edge_pts = {}  # edge_key → np.array on M
+    for edge in T.edges:
+        v1k, v2k = list(edge)
+        p1, p2 = pverts[v1k], pverts[v2k]
+        pt = surface.find_edge_intersection(p1, p2)
+        if pt is not None:
+            edge_pts[edge] = pt
+
+    # ── Step 2: face representative points → v(τ²) ──
+    face_pts = {}    # face_key → np.array
+    face_edges = {}  # face_key → list of edges intersecting M
+    for face in T.faces:
+        fv = list(face)
+        # 3 edges of this triangle
+        f_edges = [frozenset([fv[a], fv[b]])
+                   for a in range(3) for b in range(a + 1, 3)]
+        hit = [e for e in f_edges if e in edge_pts]
+        if hit:
+            face_pts[face] = np.mean([edge_pts[e] for e in hit], axis=0)
+            face_edges[face] = hit
+
+    # ── Step 3: tet representative points → v(τ³) ──
+    tet_pts = {}
+    tet_faces = {}   # tet_idx → list of faces intersecting M
+    for tet_idx, tet in enumerate(T.tetrahedra):
+        verts = list(tet)
+        t_edges = [frozenset([verts[a], verts[b]])
+                   for a in range(4) for b in range(a + 1, 4)]
+        hit = [e for e in t_edges if e in edge_pts]
+        if hit:
+            tet_pts[tet_idx] = np.mean([edge_pts[e] for e in hit], axis=0)
+            # faces of this tet that intersect M
+            t_faces = [frozenset([verts[b] for b in range(4) if b != a])
+                       for a in range(4)]
+            tet_faces[tet_idx] = [f for f in t_faces if f in face_pts]
+
+    # ── Step 4: build K's vertex list & triangles ──
+    # Vertices of K
+    K_verts = []
+    vert_idx = {}
+
+    for ek, pt in edge_pts.items():
+        vert_idx[('e', ek)] = len(K_verts)
+        K_verts.append(pt)
+    for fk, pt in face_pts.items():
+        vert_idx[('f', fk)] = len(K_verts)
+        K_verts.append(pt)
+    for ti, pt in tet_pts.items():
+        vert_idx[('t', ti)] = len(K_verts)
+        K_verts.append(pt)
+
+    # Triangles of K: one per chain  edge ⊂ face ⊂ tet  (eq. 25)
+    K_triangles = []
+    for tet_idx, faces_hit in tet_faces.items():
+        ti_key = ('t', tet_idx)
+        if ti_key not in vert_idx:
+            continue
+        ti_vi = vert_idx[ti_key]
+        for face in faces_hit:
+            fi_key = ('f', face)
+            if fi_key not in vert_idx:
+                continue
+            fi_vi = vert_idx[fi_key]
+            # edges of this face that intersect M
+            for edge in face_edges.get(face, []):
+                ei_key = ('e', edge)
+                if ei_key not in vert_idx:
+                    continue
+                ei_vi = vert_idx[ei_key]
+                K_triangles.append((ei_vi, fi_vi, ti_vi))
+
+    return {
+        'edge_pts': edge_pts,
+        'face_pts': face_pts,
+        'tet_pts': tet_pts,
+        'tet_faces': tet_faces,
+        'K_verts': K_verts,
+        'K_tris': K_triangles,
+    }
 
 
-def torus(R=1.0, r=0.3):
-    """Torus with major radius R and minor radius r."""
-    def f(p):
-        x, y, z = p
-        return (np.sqrt(x**2 + y**2) - R)**2 + z**2 - r**2
-    
-    def grad_f(p):
-        x, y, z = p
-        rho = np.sqrt(x**2 + y**2)
-        if rho < 1e-12:
-            return np.array([0.0, 0.0, 2*z])
-        factor = 2 * (rho - R) / rho
-        return np.array([factor * x, factor * y, 2*z])
-    
-    return f, grad_f, r
+# ═══════════════════════════════════════════════════════════════════
+# Visualization  (3D)
+# ═══════════════════════════════════════════════════════════════════
+
+def plot_result_3d(surface, T, pverts, K, consts, elev=25, azim=135):
+    """Four-panel 3D visualization."""
+
+    fig = plt.figure(figsize=(20, 16))
+    fig.suptitle(
+        "Whitney's Triangulation — 2D manifold in 3D\n"
+        f"{surface.name}  |  d=3, n=2  |  "
+        f"L={consts['L']:.3f}, rch(M)={consts['reach']:.3f}",
+        fontsize=14, fontweight='bold', y=0.97)
+
+    xmin, xmax, ymin, ymax, zmin, zmax = T.bounds
+    pad = consts['L'] * 2
+
+    # ─── helper: draw the reference surface (wireframe) ───
+    def draw_surface(ax, alpha=0.15, color='#E63946'):
+        u = np.linspace(0, 2 * np.pi, 80)
+        v = np.linspace(0, np.pi, 40) if surface.name.startswith('Sphere') \
+            else np.linspace(0, 2 * np.pi, 80)
+        U, V = np.meshgrid(u, v)
+        X, Y, Z = _parametric_surface(surface.name, U, V)
+        ax.plot_wireframe(X, Y, Z, color=color, alpha=alpha,
+                          linewidth=0.3, rstride=2, cstride=2)
+
+    def setup_ax(ax, title):
+        ax.set_xlim(xmin - pad, xmax + pad)
+        ax.set_ylim(ymin - pad, ymax + pad)
+        ax.set_zlim(zmin - pad, zmax + pad)
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_title(title, fontsize=11, fontweight='bold', pad=0)
+        ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+
+    # ════════ Panel 1: ambient T with surface ════════
+    ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+    draw_surface(ax1, alpha=0.25)
+    # draw a sample of ambient edges near the surface
+    _draw_ambient_edges_near_M(ax1, T, T.vertices, surface,
+                                consts, color='#457B9D', alpha=0.08)
+    setup_ax(ax1, "§4: Ambient Triangulation T\n(with surface M)")
+
+    # ════════ Panel 2: perturbed T̃ with highlighted verts ════════
+    ax2 = fig.add_subplot(2, 2, 2, projection='3d')
+    draw_surface(ax2, alpha=0.20)
+    _draw_ambient_edges_near_M(ax2, T, pverts, surface,
+                                consts, color='#457B9D', alpha=0.06)
+
+    # Show perturbation arrows
+    pert_orig, pert_new = [], []
+    for key in T.vertices:
+        d = np.linalg.norm(pverts[key] - T.vertices[key])
+        if d > 1e-10:
+            pert_orig.append(T.vertices[key])
+            pert_new.append(pverts[key])
+    if pert_new:
+        pn = np.array(pert_new)
+        ax2.scatter(pn[:, 0], pn[:, 1], pn[:, 2], c='#2A9D8F',
+                    s=18, zorder=5, depthshade=False, edgecolors='w',
+                    linewidths=0.3)
+    setup_ax(ax2,
+             f"§5: Perturbed T̃\n({len(pert_new)} vertices pushed from M)")
+
+    # ════════ Panel 3: edge intersections + face/tet centres ════════
+    ax3 = fig.add_subplot(2, 2, 3, projection='3d')
+    draw_surface(ax3, alpha=0.12)
+
+    if K['edge_pts']:
+        ep = np.array(list(K['edge_pts'].values()))
+        ax3.scatter(ep[:, 0], ep[:, 1], ep[:, 2], c='#E63946',
+                    s=10, zorder=5, label=f"v(τ¹) ×{len(ep)}",
+                    depthshade=False, edgecolors='w', linewidths=0.2)
+    if K['face_pts']:
+        fp = np.array(list(K['face_pts'].values()))
+        ax3.scatter(fp[:, 0], fp[:, 1], fp[:, 2], c='#F4A261',
+                    s=8, zorder=5, marker='D',
+                    label=f"v(τ²) ×{len(fp)}", depthshade=False)
+    if K['tet_pts']:
+        tp = np.array(list(K['tet_pts'].values()))
+        ax3.scatter(tp[:, 0], tp[:, 1], tp[:, 2], c='#264653',
+                    s=6, zorder=5, marker='s',
+                    label=f"v(τ³) ×{len(tp)}", depthshade=False)
+    ax3.legend(fontsize=8, loc='lower left')
+    setup_ax(ax3, "§6: Intersection Points\n"
+                   "(edge●, face◆, tet■ representatives)")
+
+    # ════════ Panel 4: final triangulation K ════════
+    ax4 = fig.add_subplot(2, 2, 4, projection='3d')
+    draw_surface(ax4, alpha=0.08, color='#E6939A')
+
+    verts_arr = [np.array(v) for v in K['K_verts']]
+    if K['K_tris'] and verts_arr:
+        polys = []
+        for (i0, i1, i2) in K['K_tris']:
+            polys.append([verts_arr[i0], verts_arr[i1], verts_arr[i2]])
+        pc = Poly3DCollection(polys, alpha=0.45,
+                               facecolor='#457B9D', edgecolor='#1D3557',
+                               linewidths=0.3)
+        ax4.add_collection3d(pc)
+
+    setup_ax(ax4,
+             f"§6+7: Triangulation K of M\n"
+             f"({len(K['K_tris'])} triangles, "
+             f"homeomorphic to M)")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
 
 
-if __name__ == "__main__":
-    output_dir = "/mnt/user-data/outputs"
-    
-    # Example 1: Sphere
-    print("=" * 60)
-    print("Example 1: Sphere")
-    print("=" * 60)
-    f, grad_f, reach = sphere(radius=1.0)
-    L = 0.25
-    visualize_whitney_3d(
-        f, grad_f,
-        box_min=np.array([-1.3, -1.3, -1.3]),
-        box_max=np.array([1.3, 1.3, 1.3]),
-        L=L,
-        required_dist_factor=30,
-        output_path=f"{output_dir}/whitney3d_sphere.png",
-        title=f"Whitney 3D: Sphere (L={L})",
-        show_tetrahedra=False,
-        elev=25, azim=45
-    )
-    
-    # Example 2: Ellipsoid
-    print("\n" + "=" * 60)
-    print("Example 2: Ellipsoid")
-    print("=" * 60)
-    f, grad_f, reach = ellipsoid(a=1.2, b=0.8, c=0.5)
-    L = 0.2
-    visualize_whitney_3d(
-        f, grad_f,
-        box_min=np.array([-1.5, -1.0, -0.8]),
-        box_max=np.array([1.5, 1.0, 0.8]),
-        L=L,
-        required_dist_factor=30,
-        output_path=f"{output_dir}/whitney3d_ellipsoid.png",
-        title=f"Whitney 3D: Ellipsoid (L={L})",
-        show_tetrahedra=False,
-        elev=20, azim=30
-    )
-    
-    # Example 3: Torus
-    print("\n" + "=" * 60)
-    print("Example 3: Torus")
-    print("=" * 60)
-    f, grad_f, reach = torus(R=1.0, r=0.4)
-    L = 0.2
-    visualize_whitney_3d(
-        f, grad_f,
-        box_min=np.array([-1.6, -1.6, -0.6]),
-        box_max=np.array([1.6, 1.6, 0.6]),
-        L=L,
-        required_dist_factor=25,
-        output_path=f"{output_dir}/whitney3d_torus.png",
-        title=f"Whitney 3D: Torus (L={L})",
-        show_tetrahedra=False,
-        elev=30, azim=45
-    )
-    
-    print("\n" + "=" * 60)
-    print("Done!")
-    print("=" * 60)
+def _draw_ambient_edges_near_M(ax, T, verts, surface, consts,
+                                color='#457B9D', alpha=0.1):
+    """Draw ambient edges within ~2L of the surface."""
+    threshold = 2.5 * consts['Lmax']
+    segments = []
+    for edge in T.edges:
+        v1k, v2k = list(edge)
+        p1, p2 = verts[v1k], verts[v2k]
+        mid = 0.5 * (p1 + p2)
+        cp = surface.closest_point(mid)
+        if cp is not None and np.linalg.norm(mid - cp) < threshold:
+            segments.append([p1, p2])
+        if len(segments) > 6000:
+            break
+    if segments:
+        lc = Line3DCollection(segments, colors=color, linewidths=0.25,
+                               alpha=alpha)
+        ax.add_collection3d(lc)
+
+
+def _parametric_surface(name, U, V):
+    """Parametric mesh for known surfaces (for reference wireframe)."""
+    if name.startswith('Sphere'):
+        # extract radius from name
+        r = float(name.split('r=')[1].rstrip(')'))
+        X = r * np.sin(V) * np.cos(U)
+        Y = r * np.sin(V) * np.sin(U)
+        Z = r * np.cos(V)
+    elif name.startswith('Torus'):
+        parts = name.split(',')
+        R = float(parts[0].split('R=')[1])
+        r = float(parts[1].split('r=')[1].rstrip(')'))
+        X = (R + r * np.cos(V)) * np.cos(U)
+        Y = (R + r * np.cos(V)) * np.sin(U)
+        Z = r * np.sin(V)
+    elif name.startswith('Ellipsoid'):
+        parts = name.replace(')', '').split(',')
+        a = float(parts[0].split('a=')[1])
+        b = float(parts[1].split('b=')[1])
+        c = float(parts[2].split('c=')[1])
+        X = a * np.sin(V) * np.cos(U)
+        Y = b * np.sin(V) * np.sin(U)
+        Z = c * np.cos(V)
+    else:
+        X = np.cos(U)
+        Y = np.sin(U)
+        Z = 0 * U
+    return X, Y, Z
+
+
+def plot_K_standalone(surface, K, consts, elev=25, azim=135):
+    """Large standalone plot of just the triangulation K."""
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    xmin, xmax, ymin, ymax, zmin, zmax = \
+        [-1.5, 1.5, -1.5, 1.5, -1.5, 1.5]  # default
+
+    # Reference surface
+    u = np.linspace(0, 2 * np.pi, 80)
+    v = np.linspace(0, np.pi, 40) if surface.name.startswith('Sphere') \
+        else np.linspace(0, 2 * np.pi, 80)
+    U, V = np.meshgrid(u, v)
+    X, Y, Z = _parametric_surface(surface.name, U, V)
+    ax.plot_wireframe(X, Y, Z, color='#E63946', alpha=0.06,
+                      linewidth=0.2, rstride=3, cstride=3)
+
+    # Draw K triangles
+    verts_arr = [np.array(v) for v in K['K_verts']]
+    if K['K_tris'] and verts_arr:
+        polys = []
+        for (i0, i1, i2) in K['K_tris']:
+            polys.append([verts_arr[i0], verts_arr[i1], verts_arr[i2]])
+        pc = Poly3DCollection(polys, alpha=0.5,
+                               facecolor='#A8DADC', edgecolor='#1D3557',
+                               linewidths=0.35)
+        ax.add_collection3d(pc)
+
+    # Edge intersection points (on M)
+    if K['edge_pts']:
+        ep = np.array(list(K['edge_pts'].values()))
+        ax.scatter(ep[:, 0], ep[:, 1], ep[:, 2], c='#E63946',
+                   s=4, depthshade=False, zorder=5)
+
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_title(
+        f"Triangulation K of {surface.name}\n"
+        f"{len(K['K_tris'])} triangles  |  "
+        f"{len(K['edge_pts'])} edge-surface intersections",
+        fontsize=13, fontweight='bold')
+    ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_zlabel('z')
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    plt.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Quality Metrics
+# ═══════════════════════════════════════════════════════════════════
+
+def quality_metrics(K, surface):
+    va = [np.array(v) for v in K['K_verts']]
+    tris = K['K_tris']
+    if not tris or not va:
+        return {}
+    areas, max_dist = [], 0.0
+    for (i0, i1, i2) in tris:
+        a = np.linalg.norm(np.cross(va[i1] - va[i0], va[i2] - va[i0])) / 2
+        areas.append(a)
+    for pt in K['K_verts']:
+        cp = surface.closest_point(np.array(pt))
+        if cp is not None:
+            max_dist = max(max_dist, np.linalg.norm(np.array(pt) - cp))
+    return {
+        'n_verts': len(va), 'n_tris': len(tris),
+        'n_edge_pts': len(K['edge_pts']),
+        'n_face_pts': len(K['face_pts']),
+        'n_tet_pts': len(K['tet_pts']),
+        'area_min': min(areas), 'area_max': max(areas),
+        'area_mean': np.mean(areas), 'total_area': sum(areas),
+        'max_hausdorff': max_dist,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Example Surfaces
+# ═══════════════════════════════════════════════════════════════════
+
+def sphere_surface(r=1.0):
+    return ImplicitSurface(
+        f=lambda x, y, z: x**2 + y**2 + z**2 - r**2,
+        grad_f=lambda x, y, z: (2*x, 2*y, 2*z),
+        reach=r,
+        name=f"Sphere(r={r})")
+
+
+def torus_surface(R=1.0, r=0.4):
+    """Torus with major radius R, minor radius r.  reach ≈ min(r, R-r)."""
+    rch = min(r, R - r) if R > r else r * 0.5
+    return ImplicitSurface(
+        f=lambda x, y, z: (np.sqrt(x**2 + y**2) - R)**2 + z**2 - r**2,
+        grad_f=lambda x, y, z: (
+            2 * x * (1 - R / (np.sqrt(x**2 + y**2) + 1e-30)),
+            2 * y * (1 - R / (np.sqrt(x**2 + y**2) + 1e-30)),
+            2 * z),
+        reach=rch,
+        name=f"Torus(R={R},r={r})")
+
+
+def ellipsoid_surface(a=1.2, b=0.8, c=0.6):
+    rch = min(a, b, c)**2 / max(a, b, c)
+    return ImplicitSurface(
+        f=lambda x, y, z: (x/a)**2 + (y/b)**2 + (z/c)**2 - 1,
+        grad_f=lambda x, y, z: (2*x/a**2, 2*y/b**2, 2*z/c**2),
+        reach=rch,
+        name=f"Ellipsoid(a={a},b={b},c={c})")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Main Driver
+# ═══════════════════════════════════════════════════════════════════
+
+def run(surface, L=None, bounds=None, practical_scale=50.0, verbose=True):
+    reach = surface.reach
+    if L is None:
+        L = reach / 5.0
+    if bounds is None:
+        s = reach * 1.8
+        bounds = (-s, s, -s, s, -s, s)
+
+    if verbose:
+        print("=" * 65)
+        print("  Whitney's Triangulation — 2D manifold in 3D")
+        print("  (Boissonnat–Kachanovich–Wintraecken, DCG 2021)")
+        print("=" * 65)
+        print(f"  Surface : {surface.name}")
+        print(f"  d=3, n=2   rch(M)={reach:.4f}   L={L:.4f}   "
+              f"L/rch={L/reach:.4f}")
+        print()
+
+    consts = compute_constants_3d(L, reach, practical_scale)
+    if verbose:
+        print("─── Constants (§4-5) ───")
+        print(f"  t(T)  = {consts['thickness']:.4f}")
+        print(f"  c̃     = {consts['c_tilde']:.4f}  "
+              f"(theory {consts['c_tilde_theory']:.6f})")
+        print(f"  ρ₁    = {consts['rho1']:.4f}")
+        print(f"  α₀    = {consts['alpha0']:.4f}")
+        print(f"  c̃·L_max = {consts['c_tilde']*consts['Lmax']:.4f}  "
+              f"(max perturbation)")
+        print(f"  ρ₁c̃L_max = "
+              f"{consts['rho1']*consts['c_tilde']*consts['Lmax']:.4f}  "
+              f"(tangent clearance)")
+        print()
+
+    # Part 1
+    if verbose:
+        print("─── Part 1: Ambient triangulation & perturbation ───")
+    T = FreudenthalTriangulation3D(L, bounds)
+    if verbose:
+        print(f"  Vertices:    {len(T.vertices)}")
+        print(f"  Edges:       {len(T.edges)}")
+        print(f"  Faces:       {len(T.faces)}")
+        print(f"  Tetrahedra:  {len(T.tetrahedra)}")
+
+    pverts, pinfo = perturb_vertices(T, surface, consts)
+    if verbose:
+        print(f"  Case 1 (far):      {pinfo['case1']}")
+        print(f"  Case 2 (perturbed): {pinfo['case2']}")
+        print(f"  Max perturbation:   {pinfo['max_pert']:.6f}")
+        print()
+
+    # Part 2
+    if verbose:
+        print("─── Part 2: Triangulation K ───")
+    K = construct_K(T, pverts, surface, consts)
+    if verbose:
+        print(f"  Edge intersections v(τ¹): {len(K['edge_pts'])}")
+        print(f"  Face centres v(τ²):       {len(K['face_pts'])}")
+        print(f"  Tet centres v(τ³):        {len(K['tet_pts'])}")
+        print(f"  Triangles in K:           {len(K['K_tris'])}")
+        print()
+
+    m = quality_metrics(K, surface)
+    if verbose and m:
+        print("─── Quality ───")
+        print(f"  Total area of K:   {m['total_area']:.4f}")
+        print(f"  Triangle area range: [{m['area_min']:.6f}, "
+              f"{m['area_max']:.6f}]")
+        print(f"  Max Hausdorff ≈:   {m['max_hausdorff']:.6f}")
+        print()
+
+    return T, pverts, K, consts
+
+
+# ═══════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+
+    # ── Sphere ──
+    print("\n" + "█" * 65)
+    print("  SPHERE")
+    print("█" * 65 + "\n")
+    sph = sphere_surface(r=1.0)
+    T1, pv1, K1, c1 = run(sph, L=0.35,
+                           bounds=(-1.6, 1.6, -1.6, 1.6, -1.6, 1.6))
+
+    fig1 = plot_result_3d(sph, T1, pv1, K1, c1)
+    fig1.savefig('/home/claude/sphere_3d.png', dpi=150, bbox_inches='tight')
+
+    fig1s = plot_K_standalone(sph, K1, c1)
+    fig1s.savefig('/home/claude/sphere_K.png', dpi=150, bbox_inches='tight')
+
+    # ── Torus ──
+    print("\n" + "█" * 65)
+    print("  TORUS")
+    print("█" * 65 + "\n")
+    tor = torus_surface(R=1.0, r=0.4)
+    T2, pv2, K2, c2 = run(tor, L=0.22,
+                           bounds=(-1.8, 1.8, -1.8, 1.8, -0.8, 0.8))
+
+    fig2 = plot_result_3d(tor, T2, pv2, K2, c2, elev=30, azim=120)
+    fig2.savefig('/home/claude/torus_3d.png', dpi=150, bbox_inches='tight')
+
+    fig2s = plot_K_standalone(tor, K2, c2, elev=30, azim=120)
+    fig2s.savefig('/home/claude/torus_K.png', dpi=150, bbox_inches='tight')
+
+    print("\n✓ All saved.")
+    plt.close('all')
