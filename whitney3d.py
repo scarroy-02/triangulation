@@ -8,10 +8,24 @@ Based on: Boissonnat, Kachanovich, Wintraecken (2021)
 
 Case: n = 2 (surface), d = 3 (ambient R³)
 
-Ambient triangulation: Freudenthal (Kuhn) triangulation of R³.
-  Each unit cube is split into d! = 6 tetrahedra via coordinate
-  orderings. This is closely related to the Ã₃ Coxeter triangulation
-  (whose vertex set is the BCC lattice, Fig. 4 right).
+Ambient triangulation: Coxeter triangulation of type Ã₃.
+
+  The Ã₃ Coxeter triangulation is the Freudenthal-Kuhn triangulation
+  (§2.1, Def 1).  Each unit cube of the Z³ lattice is subdivided
+  into d! = 6 tetrahedra, one per permutation σ ∈ S₃, with vertices:
+      v₀ = corner,  vₖ = vₖ₋₁ + e_{σ(k)}   for k = 1,2,3.
+
+  These are NOT regular tetrahedra — no affine map can make all 6
+  tets per cube regular simultaneously (the 7 distinct edge vectors
+  {eᵢ, eᵢ+eⱼ, (1,1,1)} are overconstrained for a 3×3 Gram matrix).
+
+  Properties:
+      Edge lengths:  L, L√2, L√3   (3 per tet of each type)
+      L_max = L√3                   (body diagonal)
+      t(T) = 1/√6 ≈ 0.408          (thickness, Def 2.2, paper §2)
+        = d·vol(σ) / (diam(σ) · max facet vol)
+        = 3·(L³/6) / (L√3 · L²√2/2)
+        = L³/2 / (L³√6/2)  =  1/√6
 
 Part 1 (§5): Perturb vertices so that the 0-skeleton (= (d-n-1)-skeleton)
   is far from M.  For codimension 1, push vertices away from T_pM.
@@ -34,40 +48,58 @@ warnings.filterwarnings('ignore')
 
 
 # ═══════════════════════════════════════════════════════════════════
-# §4: Freudenthal (Kuhn) Triangulation of R³
+# §2.1/§4: Coxeter Triangulation of type Ã₃ (= Freudenthal-Kuhn)
 # ═══════════════════════════════════════════════════════════════════
 #
-# Each cube [i,i+1]×[j,j+1]×[k,k+1] is subdivided into 6 tetrahedra.
-# For permutation σ of (0,1,2):
-#   v₀ = corner, v₁ = v₀+L·e_{σ(0)}, v₂ = v₁+L·e_{σ(1)}, v₃ = v₂+L·e_{σ(2)}
+# Definition 1 (paper §2.1): The Coxeter triangulation of type Ã_d
+# is the Freudenthal-Kuhn triangulation of R^d.  Each unit cube of
+# the integer lattice Z^d is subdivided into d! simplices by the
+# coordinate permutations.
 #
-# Properties:
-#   - Monohedral (all tets congruent)
-#   - Bounded thickness  t(T) ≈ 0.41 for d=3
-#   - Longest edge = √3·L (cube body diagonal)
-#   - Delaunay
+# For d=3: each unit cube → 6 tetrahedra.  The tetrahedron for
+# permutation σ ∈ S₃ has vertices
+#     v₀ = (i,j,k),  v₁ = v₀+e_{σ(1)},  v₂ = v₁+e_{σ(2)},
+#     v₃ = v₂+e_{σ(3)} = (i+1,j+1,k+1).
+#
+# Edge lengths: L, L√2, L√3 (NOT regular tetrahedra).
+# Thickness: t(T) = 1/√6 ≈ 0.408  (Def 2.2)
+# L_max = L√3 (body diagonal)
+#
+# Note: No affine map can make all 6 tets per cube regular
+# simultaneously.  The 7 distinct edge directions {eᵢ, eᵢ+eⱼ,
+# (1,1,1)} overconstrain the 3×3 Gram matrix A^T A.
 
-class FreudenthalTriangulation3D:
+
+class CoxeterA3Triangulation3D:
     """
-    Freudenthal/Kuhn triangulation of R³ with edge length L.
+    Coxeter triangulation of type Ã₃ (= Freudenthal-Kuhn) of R³.
+
+    Each unit cube of the lattice L·Z³ is subdivided into 6 tetrahedra
+    by coordinate permutations.  Vertices lie on L·Z³.
+
+    Simplex for permutation σ ∈ S₃:
+        v₀ = L·(i,j,k),  vₘ = vₘ₋₁ + L·e_{σ(m)}  for m=1,2,3.
+
+    Edge lengths: L, L√2, L√3.  Thickness t(T) = 1/√6.
     """
 
     def __init__(self, L, bounds, margin=2):
         """
         Parameters
         ----------
-        L : float   – grid spacing (cube side length)
-        bounds : (xmin,xmax,ymin,ymax,zmin,zmax)
-        margin : int – extra cubes beyond bounds
+        L : float   – grid spacing.  Vertex positions on L·Z³.
+        bounds : (xmin,xmax,ymin,ymax,zmin,zmax) in R³
+        margin : int – extra cells beyond bounds
         """
         self.L = L
         self.bounds = bounds
-        self.Lmax = L * np.sqrt(3)  # longest edge (body diagonal)
+        self.Lmax = L * np.sqrt(3)    # body diagonal = longest edge
 
-        # Quality: thickness = min_alt / Lmax  ≈ 1/(√6·√3) ≈ 0.236
-        self.thickness = 1.0 / (np.sqrt(6) * np.sqrt(3))
+        # Thickness (Def 2.2): t = d·V/(diam·max_face_area)
+        # = 3·(L³/6) / (L√3 · L²√2/2) = 1/√6
+        self.thickness = 1.0 / np.sqrt(6)
 
-        # The 6 permutations of axes for cube subdivision
+        # The 6 permutations of axes for cell subdivision
         self.perms = list(permutations(range(3)))
 
         # Storage
@@ -89,7 +121,7 @@ class FreudenthalTriangulation3D:
         m = margin
         L = self.L
 
-        # Integer index ranges
+        # Integer index range covering the bounds
         i0 = int(np.floor(xmin / L)) - m
         i1 = int(np.ceil(xmax / L)) + m
         j0 = int(np.floor(ymin / L)) - m
@@ -97,14 +129,14 @@ class FreudenthalTriangulation3D:
         k0 = int(np.floor(zmin / L)) - m
         k1 = int(np.ceil(zmax / L)) + m
 
-        # Create vertices
+        # Create vertices: position = L · (i, j, k)
         for i in range(i0, i1 + 2):
             for j in range(j0, j1 + 2):
                 for k in range(k0, k1 + 2):
-                    self.vertices[(i, j, k)] = np.array(
-                        [i * L, j * L, k * L], dtype=float)
+                    self.vertices[(i, j, k)] = L * np.array(
+                        [i, j, k], dtype=float)
 
-        # Create tetrahedra: 6 per cube
+        # Create tetrahedra: 6 per cell (one per permutation σ ∈ S₃)
         e = [np.array([1, 0, 0]), np.array([0, 1, 0]), np.array([0, 0, 1])]
         for i in range(i0, i1 + 1):
             for j in range(j0, j1 + 1):
@@ -123,7 +155,6 @@ class FreudenthalTriangulation3D:
                               v2[2] + e[perm[2]][2])
 
                         tet = (v0, v1, v2, v3)
-                        tet_idx = len(self.tetrahedra)
                         self.tetrahedra.append(tet)
 
                         # Edges (6 per tet)
@@ -156,6 +187,10 @@ class FreudenthalTriangulation3D:
                 for b in range(a + 1, 4):
                     edge = frozenset([verts[a], verts[b]])
                     self.edge_to_tets[edge].add(tet_idx)
+
+
+# Alias for backward compatibility
+FreudenthalTriangulation3D = CoxeterA3Triangulation3D
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -231,15 +266,17 @@ class ImplicitSurface:
 # ═══════════════════════════════════════════════════════════════════
 
 def compute_constants_3d(L, reach, practical_scale=50.0):
-    """Compute algorithm constants for d=3, n=2."""
+    """Compute algorithm constants for d=3, n=2, Coxeter Ã₃ (= Freudenthal)."""
     d, n = 3, 2
 
-    # Freudenthal thickness ≈ 1/√18 ≈ 0.236
-    t_T = 1.0 / (np.sqrt(6) * np.sqrt(3))  # conservative
-    Lmax = L * np.sqrt(3)  # longest edge
+    # Ã₃ = Freudenthal thickness (Def 2.2):
+    #   t(T) = d·vol(σ)/(diam(σ)·max_facet_vol)
+    #        = 3·(L³/6)/(L√3 · L²√2/2) = 1/√6 ≈ 0.408
+    t_T = 1.0 / np.sqrt(6)
+    Lmax = L * np.sqrt(3)  # body diagonal = longest edge
 
-    # Theoretical c̃ (eq. 6) — very small
-    c_tilde_theory = t_T ** 2 / 24.0
+    # Theoretical c̃ (eq. 6) — much better than Freudenthal due to t²
+    c_tilde_theory = t_T ** 2 / 24.0   # = (4/6)/24 = 1/36 ≈ 0.0278
     c_tilde = min(c_tilde_theory * practical_scale, 0.42)
 
     # ρ₁ (Lemma 5.1, d=3 odd, k=(d+1)/2=2)
@@ -440,7 +477,7 @@ def plot_result_3d(surface, T, pverts, K, consts, elev=25, azim=135):
 
     fig = plt.figure(figsize=(20, 16))
     fig.suptitle(
-        "Whitney's Triangulation — 2D manifold in 3D\n"
+        "Whitney's Triangulation — Coxeter Ã₃ (Freudenthal) — 2D in 3D\n"
         f"{surface.name}  |  d=3, n=2  |  "
         f"L={consts['L']:.3f}, rch(M)={consts['reach']:.3f}",
         fontsize=14, fontweight='bold', y=0.97)
@@ -719,6 +756,7 @@ def run(surface, L=None, bounds=None, practical_scale=50.0, verbose=True):
     if verbose:
         print("=" * 65)
         print("  Whitney's Triangulation — 2D manifold in 3D")
+        print("  Coxeter triangulation of type Ã₃ (= Freudenthal-Kuhn)")
         print("  (Boissonnat–Kachanovich–Wintraecken, DCG 2021)")
         print("=" * 65)
         print(f"  Surface : {surface.name}")
@@ -744,7 +782,7 @@ def run(surface, L=None, bounds=None, practical_scale=50.0, verbose=True):
     # Part 1
     if verbose:
         print("─── Part 1: Ambient triangulation & perturbation ───")
-    T = FreudenthalTriangulation3D(L, bounds)
+    T = CoxeterA3Triangulation3D(L, bounds)
     if verbose:
         print(f"  Vertices:    {len(T.vertices)}")
         print(f"  Edges:       {len(T.edges)}")
@@ -793,10 +831,10 @@ if __name__ == '__main__':
                            bounds=(-1.6, 1.6, -1.6, 1.6, -1.6, 1.6))
 
     fig1 = plot_result_3d(sph, T1, pv1, K1, c1)
-    fig1.savefig('/home/claude/sphere_3d.png', dpi=150, bbox_inches='tight')
+    fig1.savefig('sphere_3d.png', dpi=150, bbox_inches='tight')
 
     fig1s = plot_K_standalone(sph, K1, c1)
-    fig1s.savefig('/home/claude/sphere_K.png', dpi=150, bbox_inches='tight')
+    fig1s.savefig('sphere_K.png', dpi=150, bbox_inches='tight')
 
     # ── Torus ──
     print("\n" + "█" * 65)
@@ -807,10 +845,10 @@ if __name__ == '__main__':
                            bounds=(-1.8, 1.8, -1.8, 1.8, -0.8, 0.8))
 
     fig2 = plot_result_3d(tor, T2, pv2, K2, c2, elev=30, azim=120)
-    fig2.savefig('/home/claude/torus_3d.png', dpi=150, bbox_inches='tight')
+    fig2.savefig('torus_3d.png', dpi=150, bbox_inches='tight')
 
     fig2s = plot_K_standalone(tor, K2, c2, elev=30, azim=120)
-    fig2s.savefig('/home/claude/torus_K.png', dpi=150, bbox_inches='tight')
+    fig2s.savefig('torus_K.png', dpi=150, bbox_inches='tight')
 
     print("\n✓ All saved.")
     plt.close('all')
