@@ -173,10 +173,10 @@ struct PaperConstants {
   // eq. (12): the certified scale L / rch(M).
   double L_over_rch_theory;
 
-  PaperConstants() {
+  explicit PaperConstants(double pert_mult = 1.0) {
     const double c1 = t * mu0 * delta / (18.0 * d * 1.0);
     const double c2 = t * t / 24.0;
-    ctilde = std::min(c1, c2);
+    ctilde = pert_mult * std::min(c1, c2);   // pert_mult x the paper's max perturbation (eq. (6))
     alpha1 = 4.0 / 3.0 * rho1 * ctilde;
     const double binom = 3.0;  // C(d, d-n) = C(3,1)
     zeta = (8.0 / (15.0 * std::sqrt(3.0) * binom * (1.0 + 2.0 * ctilde)))
@@ -372,7 +372,8 @@ static void write_obj(const std::string& path,
 int main(int argc, char** argv) {
   // ---------------- CLI ----------------
   double      L_target = 0.08;     // practical longest-edge length
-  double      sep_mult = 1.0;      // multiplier on the rho_1 c~ L separation
+  double      sep_mult = 10.0;     // multiplier on the rho_1 c~ L separation
+  double      pert_mult = 50.0;    // multiplier on the max perturbation c~ (eq. (6))
   std::string surface  = "torus";
   std::string out_path = "whitney_mesh.obj";
   double      torus_R = 1.0, torus_r = 0.4, sphere_r = 1.0;
@@ -385,6 +386,7 @@ int main(int argc, char** argv) {
     };
     if      (a == "--L")        L_target = std::stod(need("--L"));
     else if (a == "--sep-mult") sep_mult = std::stod(need("--sep-mult"));
+    else if (a == "--pert-mult") pert_mult = std::stod(need("--pert-mult"));
     else if (a == "--surface")  surface  = need("--surface");
     else if (a == "--out")      out_path = need("--out");
     else if (a == "--R")        torus_R  = std::stod(need("--R"));
@@ -392,7 +394,7 @@ int main(int argc, char** argv) {
     else if (a == "--sphere-r") sphere_r = std::stod(need("--sphere-r"));
     else {
       std::printf("usage: %s [--surface torus|sphere] [--L h] [--sep-mult m]\n"
-                  "          [--R R] [--r r] [--sphere-r r] [--out file.obj]\n", argv[0]);
+                  "          [--pert-mult m] [--R R] [--r r] [--sphere-r r] [--out file.obj]\n", argv[0]);
       return a == "--help" ? 0 : 1;
     }
   }
@@ -401,7 +403,7 @@ int main(int argc, char** argv) {
   if (surface == "sphere") M = std::make_unique<Sphere>(sphere_r);
   else                     M = std::make_unique<Torus>(torus_R, torus_r);
 
-  PaperConstants C;
+  PaperConstants C(pert_mult);
 
   // ---------------- ambient A~_3 triangulation (GUDHI) ----------------
   const int d = 3;
