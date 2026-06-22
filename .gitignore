@@ -1,3 +1,5 @@
 Medit-master/
 example
 __pycache__/
+*.obj
+*.mtl
